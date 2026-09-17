@@ -1520,13 +1520,32 @@ async def clear_tournament_roles(guild: discord.Guild, tournament_id: int) -> No
         logger.warning('clear_tournament_roles: failed to clear roles for: %s', ', '.join(failed))
         raise TournamentError('Tournament roles could not be cleared for: ' + ', '.join(failed))
 
-async def respond(interaction: discord.Interaction, content: str, *, embed: discord.Embed | None=None, ephemeral: bool=False, view: discord.ui.View | None=None) -> None:
-    """Safely answer an interaction without causing a second interaction error."""
+async def respond(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    embed: discord.Embed | None = None,
+    ephemeral: bool = False,
+    view: discord.ui.View | None = None,
+    allowed_mentions: discord.AllowedMentions | None = None,
+) -> None:
+    """Safely answer an interaction without causing a second interaction error.
+
+    ``allowed_mentions`` is forwarded so World Cup country-role mentions such
+    as ``<@&ROLE_ID>`` are actually rendered as Discord mentions.
+    """
     try:
+        kwargs = {
+            "embed": embed,
+            "ephemeral": ephemeral,
+            "view": view or discord.utils.MISSING,
+        }
+        if allowed_mentions is not None:
+            kwargs["allowed_mentions"] = allowed_mentions
         if interaction.response.is_done():
-            await interaction.followup.send(content, embed=embed, ephemeral=ephemeral, view=view or discord.utils.MISSING)
+            await interaction.followup.send(content, **kwargs)
         else:
-            await interaction.response.send_message(content, embed=embed, ephemeral=ephemeral, view=view or discord.utils.MISSING)
+            await interaction.response.send_message(content, **kwargs)
     except discord.NotFound:
         logger.warning('Interaction %s could not be answered (expired/unknown).', interaction.id)
     except discord.HTTPException as error:
@@ -4359,7 +4378,11 @@ async def handle_confirm_result(interaction: discord.Interaction, match_id: int,
         message = f"✅ **Result Confirmed:** {player1_label} **{match['score1']} - {match['score2']}** {player2_label}."
         event = result.get('event')
         message += await _apply_event_side_effects(guild, int(result['tournament_id']), event)
-        await respond(interaction, message)
+        await respond(
+            interaction,
+            message,
+            allowed_mentions=allowed_mentions,
+        )
         await _disable_result_buttons(interaction, note='Confirmed.')
     except TournamentError as error:
         await respond(interaction, str(error), ephemeral=True)
@@ -4472,7 +4495,12 @@ class ScoreReportModal(discord.ui.Modal):
             else:
                 message = f'✅ **Result Confirmed:** {player1_label} **{fixture_score}** {player2_label}.'
                 message += await _apply_event_side_effects(self.guild, int(result['tournament_id']), event)
-            await respond(interaction, message, view=view)
+            await respond(
+                interaction,
+                message,
+                view=view,
+                allowed_mentions=allowed_mentions,
+            )
         except TournamentError as error:
             await respond(interaction, str(error), ephemeral=True)
         except Exception:
@@ -4562,7 +4590,11 @@ async def post_pending_confirmations(interaction: discord.Interaction, tournamen
             f"⏳ {opponent_mention}, please confirm this is correct, or dispute it if it isn't. "
             f"The match will not be completed or advanced until then."
         )
-        await target_channel.send(content=message, view=ResultActionView(int(match['id']), opponent_id), allowed_mentions=allowed_mentions)
+        await target_channel.send(
+            content=message,
+            view=ResultActionView(int(match['id']), opponent_id),
+            allowed_mentions=allowed_mentions,
+        )
         posted += 1
     await respond(interaction, f"Posted confirmation buttons for {posted} pending result{('s' if posted != 1 else '')} in {target_channel.mention}.", ephemeral=True)
 
