@@ -2390,7 +2390,7 @@ async def _award_monthly_ballon_dor(
 ) -> tuple[discord.Member, discord.Role, dict[str, Any]]:
     rows = await _store_call(bot.store.ballon_dor_candidates_for_guild, guild.id, month)
     if not rows:
-        raise ValueError(f'No completed competitive tournaments were found for {month}.')
+        raise ValueError(f'No active or completed competitive tournaments were found for {month}.')
     if override_member is not None:
         winner = next((row for row in rows if int(row['user_id']) == int(override_member.id)), None)
         if winner is None:
@@ -4626,7 +4626,7 @@ async def ballon_dor_ranking(interaction: discord.Interaction, month: str) -> No
             title=f"🏆 Ballon d'Or Ranking — {period}",
             description=_format_ballon_dor_ranking(rows),
         )
-        embed.set_footer(text="Competitive tournaments only · KO Match excluded · No assists required")
+        embed.set_footer(text="Live from official completed match results · Tournament start month locked · KO Match excluded")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except ValueError as exc:
         await interaction.followup.send(f'❌ **Ranking unavailable.**\n\n{exc}', ephemeral=True)
@@ -4813,7 +4813,7 @@ async def golden_boot_standings(interaction: discord.Interaction, month: str, sc
             description=description,
             color=discord.Color.gold(),
         )
-        embed.set_footer(text=f"{category} · Official completed results only · KO Match excluded")
+        embed.set_footer(text=f"{category} · Live from official completed match results · Tournament start month locked · KO Match excluded")
         await interaction.followup.send(embed=embed)
     except ValueError as exc:
         await interaction.followup.send(f'❌ **Standings unavailable.**\n\n{exc}', ephemeral=True)
@@ -4870,7 +4870,7 @@ async def goal_records(interaction: discord.Interaction, tournament_id: int | No
         description='\n'.join(lines),
         color=discord.Color.green(),
     )
-    embed.set_footer(text='Official completed results only · KO Match excluded')
+    embed.set_footer(text='Live from official completed match results · Tournament start month locked · KO Match excluded')
     await respond(interaction, '', embed=embed)
 
 @bot.tree.command(name='tournament_status', description='Show the current tournament status.')

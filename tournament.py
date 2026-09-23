@@ -481,6 +481,7 @@ class TournamentStore:
                     created_by BIGINT NOT NULL,
                     created_at TEXT NOT NULL,
                     registration_closed_at TEXT,
+                    tournament_started_at TEXT,
                     group_stage_deadline_at TEXT,
                     league_deadline_at TEXT,
                     round_of_32_deadline_at TEXT,
@@ -750,6 +751,9 @@ class TournamentStore:
             },
             "tournaments": {
                 "registration_closed_at": "TEXT",
+                # Immutable competition-start timestamp. Legacy rows are
+                # backfilled from registration_closed_at/created_at.
+                "tournament_started_at": "TEXT",
                 # When the group stage's 48-hour completion window ends.
                 # Nullable/absent for round-robin (KO Match) tournaments and
                 # for any tournament that hasn't reached the group stage yet.
@@ -865,6 +869,19 @@ class TournamentStore:
                     table_name,
                     column_name,
                 )
+
+        # Legacy tournaments used registration_closed_at as their effective
+        # start timestamp. Preserve that historical assignment permanently.
+        try:
+            self.connection.execute(
+                """UPDATE tournaments
+                   SET tournament_started_at = COALESCE(
+                       tournament_started_at, registration_closed_at, created_at
+                   )
+                   WHERE tournament_started_at IS NULL"""
+            )
+        except Exception:
+            logger.exception("Unable to backfill tournaments.tournament_started_at")
 
     def _migrate_group_channel_columns(self) -> None:
         """One-time backfill from the old fixed group_a..group_d columns
@@ -1587,10 +1604,12 @@ class TournamentStore:
             self.connection.execute(
                 """
                 UPDATE tournaments
-                SET status = 'closed', registration_closed_at = ?
+                SET status = 'closed',
+                    registration_closed_at = ?,
+                    tournament_started_at = COALESCE(tournament_started_at, ?)
                 WHERE id = ?
                 """,
-                (now, tournament_id_value),
+                (now, now, tournament_id_value),
             )
             if tournament["tournament_type"] == ROUND_ROBIN:
                 # Despite the historical option name "round_robin", this
@@ -2158,10 +2177,11 @@ class TournamentStore:
         return [dict(row) for row in rows]
 
     def golden_boot_candidates_for_guild(self, guild_id: int, month: str, scope: str) -> list[dict[str, Any]]:
-        """Return monthly Golden Boot standings for one guild.
+        """Return live monthly Golden Boot standings.
 
-        Uses completed competitive tournaments whose recorded start month is
-        ``month``. KO Match is never included.
+        The tournament start month owns the entire tournament. Closed
+        (ongoing) and completed tournaments count; only completed match
+        results contribute goals. KO Match is excluded.
         """
         month = str(month).strip()
         if not re.fullmatch(r"\d{4}-\d{2}", month):
@@ -2179,55 +2199,73 @@ class TournamentStore:
         if scope not in groups:
             raise ValueError("Golden Boot scope must be pl, wc, cl, or combined.")
         placeholders = ",".join("?" for _ in groups[scope])
+        params = (
+            int(guild_id), ROUND_ROBIN, month, *groups[scope],
+            int(guild_id), ROUND_ROBIN, month, *groups[scope],
+        )
         rows = self._all(
-            f"""SELECT gr.user_id, MAX(gr.display_name) AS display_name,
-                       MAX(gr.nation_name) AS nation_name, SUM(gr.goals) AS goals,
-                       COUNT(DISTINCT gr.tournament_id) AS tournaments_count
-                  FROM goal_records gr
-                  JOIN tournaments t ON t.id = gr.tournament_id
+            f"""SELECT
+                       m.player1_id AS user_id,
+                       COALESCE(tp.display_name, 'Unknown Player') AS display_name,
+                       tp.nation_name AS nation_name,
+                       SUM(m.score1) AS goals,
+                       COUNT(DISTINCT m.tournament_id) AS tournaments_count
+                  FROM matches m
+                  JOIN tournaments t ON t.id = m.tournament_id
+                  LEFT JOIN tournament_players tp
+                    ON tp.tournament_id = m.tournament_id
+                   AND tp.user_id = m.player1_id
                  WHERE t.guild_id = ?
-                   AND t.status = 'completed'
-                   AND substr(COALESCE(t.registration_closed_at, t.created_at), 1, 7) = ?
+                   AND t.status IN ('closed', 'completed')
+                   AND t.tournament_type <> ?
+                   AND substr(COALESCE(t.tournament_started_at,
+                                       t.registration_closed_at,
+                                       t.created_at), 1, 7) = ?
                    AND t.template_id IN ({placeholders})
-                 GROUP BY gr.user_id
-                 ORDER BY SUM(gr.goals) DESC, MAX(gr.display_name) ASC, gr.user_id ASC""",
-            (int(guild_id), month, *groups[scope]),
-        )
-        return [dict(row) for row in rows]
-
-    def golden_boot_candidates(self, month: str, scope: str) -> list[dict[str, Any]]:
-        """Return completed competitive goal totals for a calendar month.
-
-        Scope is ``pl``, ``wc``, ``cl`` or ``combined``. KO Match is never
-        included. The tournament start month defines the competition month. The start timestamp is registration_closed_at (with created_at as a legacy fallback).
-        """
-        month = str(month).strip()
-        if not re.fullmatch(r"\d{4}-\d{2}", month):
-            raise ValueError("Month must use YYYY-MM format, for example 2026-09.")
-        scope = str(scope).strip().lower()
-        groups = {
-            "pl": (TEMPLATE_PREMIER_LEAGUE,),
-            "wc": tuple(sorted(WORLD_CUP_TEMPLATE_IDS)),
-            "cl": (TEMPLATE_CHAMPIONS_LEAGUE,),
-            "combined": (TEMPLATE_PREMIER_LEAGUE, TEMPLATE_WEEKLY_CHAMPIONSHIP, TEMPLATE_CHAMPIONS_LEAGUE, *tuple(sorted(WORLD_CUP_TEMPLATE_IDS))),
-        }
-        if scope not in groups:
-            raise ValueError("Golden Boot scope must be pl, wc, cl, or combined.")
-        placeholders = ",".join("?" for _ in groups[scope])
-        rows = self._all(
-            f"""SELECT gr.user_id, MAX(gr.display_name) AS display_name,
-                       MAX(gr.nation_name) AS nation_name, SUM(gr.goals) AS goals,
-                       COUNT(DISTINCT gr.tournament_id) AS tournaments_count
-                  FROM goal_records gr
-                  JOIN tournaments t ON t.id = gr.tournament_id
-                 WHERE t.status = 'completed'
-                   AND substr(COALESCE(t.registration_closed_at, t.created_at), 1, 7) = ?
+                   AND m.status = 'completed'
+                   AND m.score1 IS NOT NULL
+                 GROUP BY m.player1_id, tp.display_name, tp.nation_name
+                 UNION ALL
+                SELECT
+                       m.player2_id AS user_id,
+                       COALESCE(tp.display_name, 'Unknown Player') AS display_name,
+                       tp.nation_name AS nation_name,
+                       SUM(m.score2) AS goals,
+                       COUNT(DISTINCT m.tournament_id) AS tournaments_count
+                  FROM matches m
+                  JOIN tournaments t ON t.id = m.tournament_id
+                  LEFT JOIN tournament_players tp
+                    ON tp.tournament_id = m.tournament_id
+                   AND tp.user_id = m.player2_id
+                 WHERE t.guild_id = ?
+                   AND t.status IN ('closed', 'completed')
+                   AND t.tournament_type <> ?
+                   AND substr(COALESCE(t.tournament_started_at,
+                                       t.registration_closed_at,
+                                       t.created_at), 1, 7) = ?
                    AND t.template_id IN ({placeholders})
-                 GROUP BY gr.user_id
-                 ORDER BY SUM(gr.goals) DESC, MAX(gr.display_name) ASC, gr.user_id ASC""",
-            (month, *groups[scope]),
+                   AND m.status = 'completed'
+                   AND m.score2 IS NOT NULL
+                 GROUP BY m.player2_id, tp.display_name, tp.nation_name""",
+            params,
         )
-        return [dict(row) for row in rows]
+        totals: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            uid = int(row["user_id"])
+            item = totals.setdefault(uid, {
+                "user_id": uid,
+                "display_name": row["display_name"],
+                "nation_name": row["nation_name"],
+                "goals": 0,
+                "tournaments_count": 0,
+            })
+            item["goals"] += int(row["goals"] or 0)
+            item["tournaments_count"] += int(row["tournaments_count"] or 0)
+            if row["nation_name"]:
+                item["nation_name"] = row["nation_name"]
+        result = list(totals.values())
+        result.sort(key=lambda r: (-int(r["goals"]), str(r["display_name"]).casefold(), int(r["user_id"])))
+        return result
 
     def golden_boot_award(self, guild_id: int, award_key: str, month: str, scope: str,
                           user_id: int, role_id: int, goals: int, tournament_ids: list[int]) -> dict[str, Any]:
@@ -2251,89 +2289,145 @@ class TournamentStore:
         return dict(row) if row else None
 
     def ballon_dor_candidates_for_guild(self, guild_id: int, month: str) -> list[dict[str, Any]]:
-        """Return an automatic monthly Ballon d'Or ranking for one guild."""
+        """Return a live monthly Ballon d'Or ranking.
+
+        The month is determined by when each tournament started. Ongoing
+        tournaments contribute completed-match goals/wins immediately.
+        Placement bonuses are added only after a tournament is completed.
+        """
         month = str(month).strip()
         if not re.fullmatch(r"\d{4}-\d{2}", month):
             raise ValueError("Month must use YYYY-MM format, for example 2026-09.")
         with self._lock:
             tournaments = [dict(row) for row in self._all(
                 """SELECT * FROM tournaments
-                   WHERE guild_id = ? AND status = 'completed'
-                     AND substr(COALESCE(registration_closed_at, created_at), 1, 7) = ?
+                   WHERE guild_id = ?
+                     AND status IN ('closed', 'completed')
+                     AND substr(COALESCE(tournament_started_at,
+                                         registration_closed_at,
+                                         created_at), 1, 7) = ?
                      AND tournament_type <> ?
                    ORDER BY id ASC""",
                 (int(guild_id), month, ROUND_ROBIN),
             )]
             stats: dict[int, dict[str, Any]] = {}
 
-            def ensure_player(uid: int, name: str, nation: str | None) -> dict[str, Any]:
+            def ensure_player(uid: int, name: str | None, nation: str | None) -> dict[str, Any]:
                 row = stats.setdefault(uid, {
-                    'user_id': uid, 'display_name': name or f'Player {uid}',
-                    'nation_name': nation, 'goals': 0, 'wins': 0,
-                    'championships': 0, 'runner_ups': 0, 'semifinals': 0,
-                    'score': 0, 'tournaments_count': 0,
+                    "user_id": uid,
+                    "display_name": name or f"Player {uid}",
+                    "nation_name": nation,
+                    "goals": 0,
+                    "wins": 0,
+                    "championships": 0,
+                    "runner_ups": 0,
+                    "semifinals": 0,
+                    "score": 0,
+                    "tournaments_count": 0,
                 })
+                if name:
+                    row["display_name"] = name
                 if nation:
-                    row['nation_name'] = nation
+                    row["nation_name"] = nation
                 return row
 
             for tournament in tournaments:
-                tid = int(tournament['id'])
-                players = {int(p['user_id']): p for p in self.players(tid)}
-                completed = [m for m in self.matches(tid) if m.get('status') == 'completed']
+                tid = int(tournament["id"])
+                players = {int(p["user_id"]): p for p in self.players(tid)}
+                completed = [m for m in self.matches(tid) if m.get("status") == "completed"]
                 involved: set[int] = set()
+
                 for match in completed:
-                    for side, score_key in ((1, 'score1'), (2, 'score2')):
-                        uid = match.get(f'player{side}_id')
+                    for side, score_key in ((1, "score1"), (2, "score2")):
+                        uid = match.get(f"player{side}_id")
                         if uid is None:
                             continue
-                        uid = int(uid); involved.add(uid)
+                        uid = int(uid)
+                        involved.add(uid)
                         p = players.get(uid, {})
-                        row = ensure_player(uid, str(p.get('display_name') or f'Player {uid}'), p.get('nation_name'))
-                        row['goals'] += int(match.get(score_key) or 0)
-                        if match.get('score1') is not None and match.get('score2') is not None:
-                            other = 'score2' if side == 1 else 'score1'
+                        row = ensure_player(
+                            uid,
+                            str(p.get("display_name") or f"Player {uid}"),
+                            p.get("nation_name"),
+                        )
+                        row["goals"] += int(match.get(score_key) or 0)
+                        if match.get("score1") is not None and match.get("score2") is not None:
+                            other = "score2" if side == 1 else "score1"
                             if int(match[score_key]) > int(match[other]):
-                                row['wins'] += 1
-                for uid in involved:
-                    ensure_player(uid, str(players.get(uid, {}).get('display_name') or f'Player {uid}'), players.get(uid, {}).get('nation_name'))['tournaments_count'] += 1
+                                row["wins"] += 1
 
+                for uid in involved:
+                    p = players.get(uid, {})
+                    ensure_player(
+                        uid,
+                        str(p.get("display_name") or f"Player {uid}"),
+                        p.get("nation_name"),
+                    )["tournaments_count"] += 1
+
+                # Placement bonuses are final-only. An ongoing tournament can
+                # never receive a champion/runner-up/semifinalist bonus yet.
                 placements: dict[int, tuple[str, int]] = {}
-                if tournament.get('tournament_type') == GROUP_KNOCKOUT:
-                    try:
-                        result = self._validate_completed_champions_result(tid)
-                        placements = {int(uid): (place, int(points)) for uid, (place, points) in result['placements'].items()}
-                    except ValueError:
-                        # A completed legacy tournament may not have a fully
-                        # shaped bracket. Goals/wins remain valid; don't make
-                        # the whole monthly ranking fail because placement
-                        # metadata cannot be safely inferred.
-                        placements = {}
-                elif tournament.get('tournament_type') == LEAGUE:
-                    try:
-                        table = self.standings(tid)
-                        if table:
-                            if len(table) >= 1: placements[int(table[0].user_id)] = ('champion', 10)
-                            if len(table) >= 2: placements[int(table[1].user_id)] = ('runner_up', 6)
-                            if len(table) >= 3: placements[int(table[2].user_id)] = ('third_place', 3)
-                    except Exception:
-                        placements = {}
+                if tournament.get("status") == "completed":
+                    if tournament.get("tournament_type") == GROUP_KNOCKOUT:
+                        try:
+                            result = self._validate_completed_champions_result(tid)
+                            placements = {
+                                int(uid): (place, int(points))
+                                for uid, (place, points) in result["placements"].items()
+                            }
+                        except ValueError as exc:
+                            logger.warning(
+                                "Skipping Ballon d'Or placement bonus for tournament %s: %s",
+                                tid, exc,
+                            )
+                    elif tournament.get("tournament_type") == LEAGUE:
+                        try:
+                            table = self.standings(tid)
+                            if table:
+                                placements[int(table[0].user_id)] = ("champion", 10)
+                                if len(table) >= 2:
+                                    placements[int(table[1].user_id)] = ("runner_up", 6)
+                                if len(table) >= 3:
+                                    placements[int(table[2].user_id)] = ("third_place", 3)
+                        except Exception:
+                            logger.exception(
+                                "Unable to calculate Ballon d'Or league placement bonus for tournament %s",
+                                tid,
+                            )
+
                 for uid, (place, bonus) in placements.items():
                     if uid not in players:
                         continue
-                    row = ensure_player(uid, str(players[uid].get('display_name') or f'Player {uid}'), players[uid].get('nation_name'))
-                    row['score'] += int(bonus)
-                    if place == 'champion': row['championships'] += 1
-                    elif place == 'runner_up': row['runner_ups'] += 1
-                    elif place == 'semifinalist': row['semifinals'] += 1
+                    p = players[uid]
+                    row = ensure_player(
+                        uid,
+                        str(p.get("display_name") or f"Player {uid}"),
+                        p.get("nation_name"),
+                    )
+                    row["score"] += int(bonus)
+                    if place == "champion":
+                        row["championships"] += 1
+                    elif place == "runner_up":
+                        row["runner_ups"] += 1
+                    elif place == "semifinalist":
+                        row["semifinals"] += 1
 
             for row in stats.values():
-                row['score'] += int(row['goals']) + int(row['wins'])
-                row['placement_bonus'] = int(row['score']) - int(row['goals']) - int(row['wins'])
+                row["score"] += int(row["goals"]) + int(row["wins"])
+                row["placement_bonus"] = int(row["score"]) - int(row["goals"]) - int(row["wins"])
+
             rows = list(stats.values())
-            rows.sort(key=lambda r: (-int(r['score']), -int(r['goals']), -int(r['wins']), str(r['display_name']).casefold(), int(r['user_id'])))
+            rows.sort(
+                key=lambda r: (
+                    -int(r["score"]),
+                    -int(r["goals"]),
+                    -int(r["wins"]),
+                    str(r["display_name"]).casefold(),
+                    int(r["user_id"]),
+                )
+            )
             for index, row in enumerate(rows, 1):
-                row['rank'] = index
+                row["rank"] = index
             return rows
 
     def ballon_dor_award(self, guild_id: int, month: str, user_id: int, role_id: int, score: int) -> dict[str, Any]:
