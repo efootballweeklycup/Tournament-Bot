@@ -4684,8 +4684,8 @@ async def ballon_dor_ranking(interaction: discord.Interaction, month: str) -> No
     if not re.fullmatch(r'\d{4}-\d{2}', month):
         await interaction.response.send_message('❌ Month must use **YYYY-MM** format, for example `2026-09`.', ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
     try:
+        await interaction.response.defer(ephemeral=True)
         rows = await _store_call(bot.store.ballon_dor_candidates_for_guild, interaction.guild.id, month)
         period = _golden_boot_month_label(month)
         embed = discord.Embed(
@@ -4695,10 +4695,10 @@ async def ballon_dor_ranking(interaction: discord.Interaction, month: str) -> No
         embed.set_footer(text="Competitive tournaments only · KO Match excluded · No assists required")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except ValueError as exc:
-        await interaction.followup.send(f'❌ **Ranking unavailable.**\n\n{exc}', ephemeral=True)
+        await respond(interaction, f'❌ **Ranking unavailable.**\n\n{exc}', ephemeral=True)
     except Exception:
         logger.exception("Failed to calculate Ballon d'Or ranking for %s", month)
-        await interaction.followup.send("❌ Failed to calculate the Ballon d'Or ranking. Check the bot logs.", ephemeral=True)
+        await respond(interaction, "❌ Failed to calculate the Ballon d'Or ranking. Check the bot logs.", ephemeral=True)
 
 
 @bot.tree.command(name='ballon_dor_award', description="Award the monthly Ballon d'Or title role.")
@@ -4859,8 +4859,8 @@ async def golden_boot_standings(interaction: discord.Interaction, month: str, sc
     if not re.fullmatch(r'\d{4}-\d{2}', month):
         await interaction.response.send_message('❌ Month must use **YYYY-MM** format, for example `2026-09`.', ephemeral=True)
         return
-    await interaction.response.defer()
     try:
+        await interaction.response.defer()
         rows = await _store_call(bot.store.golden_boot_candidates_for_guild, interaction.guild.id, month, scope.value)
         period = _golden_boot_month_label(month)
         category = GOLDEN_BOOT_SCOPE_NAMES[scope.value]
@@ -4882,10 +4882,10 @@ async def golden_boot_standings(interaction: discord.Interaction, month: str, sc
         embed.set_footer(text=f"{category} · Official completed results only · KO Match excluded")
         await interaction.followup.send(embed=embed)
     except ValueError as exc:
-        await interaction.followup.send(f'❌ **Standings unavailable.**\n\n{exc}', ephemeral=True)
+        await respond(interaction, f'❌ **Standings unavailable.**\n\n{exc}', ephemeral=True)
     except Exception:
         logger.exception('Failed to calculate Golden Boot standings for %s/%s', month, scope.value)
-        await interaction.followup.send('❌ Failed to calculate the Golden Boot standings. Check the bot logs.', ephemeral=True)
+        await respond(interaction, '❌ Failed to calculate the Golden Boot standings. Check the bot logs.', ephemeral=True)
 
 
 @bot.tree.command(name='goal_records', description='Show goals scored by players in a competitive tournament.')
