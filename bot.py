@@ -430,17 +430,6 @@ async def world_cup_player_role_mentions(guild: discord.Guild, tournament_id: in
     roles = await sync_world_cup_nation_roles(guild, tournament_id)
     return {int(row['user_id']): roles[int(row['user_id'])].mention for row in players if int(row['user_id']) in roles}
 
-async def result_display_labels(guild: discord.Guild, tournament_id: int) -> tuple[dict[int, str], discord.AllowedMentions]:
-    """Return labels for result messages, using World Cup country roles when applicable."""
-    tournament = await _store_call(bot.store.get_tournament, int(tournament_id))
-    players = await _store_call(bot.store.players, int(tournament_id))
-    labels = tournament_player_labels(players)
-    if tournament and str(tournament.get('template_id') or '') in WORLD_CUP_TEMPLATE_IDS:
-        role_mentions = await world_cup_player_role_mentions(guild, int(tournament_id), players)
-        labels = {int(row['user_id']): role_mentions.get(int(row['user_id']), labels.get(int(row['user_id']), row.get('display_name', f"Player {row['user_id']}"))) for row in players}
-        return labels, discord.AllowedMentions(roles=True, users=False, everyone=False)
-    return labels, discord.AllowedMentions(roles=False, users=True, everyone=False)
-
 def format_match(guild: discord.Guild, match: dict[str, Any], player_names: dict[int, str] | None=None, display_number: int | None=None) -> str:
     first = format_user(guild, int(match['player1_id']), player_names)
     second = format_user(guild, int(match['player2_id']), player_names)
@@ -1520,32 +1509,13 @@ async def clear_tournament_roles(guild: discord.Guild, tournament_id: int) -> No
         logger.warning('clear_tournament_roles: failed to clear roles for: %s', ', '.join(failed))
         raise TournamentError('Tournament roles could not be cleared for: ' + ', '.join(failed))
 
-async def respond(
-    interaction: discord.Interaction,
-    content: str,
-    *,
-    embed: discord.Embed | None = None,
-    ephemeral: bool = False,
-    view: discord.ui.View | None = None,
-    allowed_mentions: discord.AllowedMentions | None = None,
-) -> None:
-    """Safely answer an interaction without causing a second interaction error.
-
-    ``allowed_mentions`` is forwarded so World Cup country-role mentions such
-    as ``<@&ROLE_ID>`` are actually rendered as Discord mentions.
-    """
+async def respond(interaction: discord.Interaction, content: str, *, embed: discord.Embed | None=None, ephemeral: bool=False, view: discord.ui.View | None=None) -> None:
+    """Safely answer an interaction without causing a second interaction error."""
     try:
-        kwargs = {
-            "embed": embed,
-            "ephemeral": ephemeral,
-            "view": view or discord.utils.MISSING,
-        }
-        if allowed_mentions is not None:
-            kwargs["allowed_mentions"] = allowed_mentions
         if interaction.response.is_done():
-            await interaction.followup.send(content, **kwargs)
+            await interaction.followup.send(content, embed=embed, ephemeral=ephemeral, view=view or discord.utils.MISSING)
         else:
-            await interaction.response.send_message(content, **kwargs)
+            await interaction.response.send_message(content, embed=embed, ephemeral=ephemeral, view=view or discord.utils.MISSING)
     except discord.NotFound:
         logger.warning('Interaction %s could not be answered (expired/unknown).', interaction.id)
     except discord.HTTPException as error:
@@ -4372,17 +4342,12 @@ async def handle_confirm_result(interaction: discord.Interaction, match_id: int,
             await respond(interaction, 'There is no submitted result to confirm.', ephemeral=True)
             return
         result = await _store_call(bot.store.report_result, match_id, opponent_id, int(match['score1']), int(match['score2']))
-        labels, allowed_mentions = await result_display_labels(guild, int(match['tournament_id']))
-        player1_label = labels.get(int(match['player1_id']), format_user(guild, int(match['player1_id'])))
-        player2_label = labels.get(int(match['player2_id']), format_user(guild, int(match['player2_id'])))
-        message = f"✅ **Result Confirmed:** {player1_label} **{match['score1']} - {match['score2']}** {player2_label}."
+        reporter_id = int(match['reported_by'])
+        labels = tournament_player_labels(await _store_call(bot.store.players, int(match['tournament_id'])))
+        message = f"✅ **{labels.get(int(interaction.user.id), interaction.user.display_name)}** confirmed the result: **{match['score1']} - {match['score2']}** (submitted by {format_user(guild, reporter_id, labels)})."
         event = result.get('event')
         message += await _apply_event_side_effects(guild, int(result['tournament_id']), event)
-        await respond(
-            interaction,
-            message,
-            allowed_mentions=allowed_mentions,
-        )
+        await respond(interaction, message)
         await _disable_result_buttons(interaction, note='Confirmed.')
     except TournamentError as error:
         await respond(interaction, str(error), ephemeral=True)
@@ -4404,17 +4369,9 @@ async def handle_dispute_result(interaction: discord.Interaction, match_id: int,
             return
         thread = await _find_or_create_dispute_thread(guild, match)
         await _store_call(bot.store.mark_disputed, match_id, opponent_id, thread.id)
-        labels, allowed_mentions = await result_display_labels(guild, int(match['tournament_id']))
-        player1_label = labels.get(int(match['player1_id']), format_user(guild, int(match['player1_id'])))
-        player2_label = labels.get(int(match['player2_id']), format_user(guild, int(match['player2_id'])))
-        await thread.send(
-            f"⚠️ **Result dispute for match `#{match_id}`**\n"
-            f"{player1_label} **{match['score1']} - {match['score2']}** {player2_label}, "
-            f"disputed by {interaction.user.mention}.\n\n"
-            f"Both players: please post your proof here (screenshots or a screen recording of the final score). "
-            f"A moderator will review this and resolve it with `/set_result`.",
-            allowed_mentions=allowed_mentions
-        )
+        reporter_id = int(match['reported_by'])
+        labels = tournament_player_labels(await _store_call(bot.store.players, int(match['tournament_id'])))
+        await thread.send(f"⚠️ **Result dispute for match `#{match_id}`**\n{format_user(guild, reporter_id, labels)} submitted **{match['score1']} - {match['score2']}**, which {interaction.user.mention} disputed.\n\nBoth players: please post your proof here (screenshots or a screen recording of the final score). A moderator will review this and resolve it with `/set_result`.")
         await respond(interaction, f"I've opened {thread.mention} for this dispute — please post your proof there.", ephemeral=True)
         await _disable_result_buttons(interaction, note='Disputed — see the thread.')
     except TournamentError as error:
@@ -4475,32 +4432,19 @@ class ScoreReportModal(discord.ui.Modal):
                 db_score1 = opponent_score
                 db_score2 = your_score
             result = await _store_call(bot.store.report_result, self.match_id, self.reporter_id, db_score1, db_score2)
+            shown_score = f'{your_score} - {opponent_score}'
+            opponent_name = format_user(self.guild, self.opponent_id, tournament_player_labels(await _store_call(bot.store.players, self.tournament_id)))
             event = result.get('event')
-            labels, allowed_mentions = await result_display_labels(self.guild, int(result['tournament_id']))
-            player1_label = labels.get(int(match['player1_id']), format_user(self.guild, int(match['player1_id'])))
-            player2_label = labels.get(int(match['player2_id']), format_user(self.guild, int(match['player2_id'])))
-            opponent_label = labels.get(int(self.opponent_id), format_user(self.guild, self.opponent_id))
-            # Always display the score in fixture/player1 -> player2 order,
-            # not in the reporter's perspective.
-            fixture_score = f'{db_score1} - {db_score2}'
+            labels = tournament_player_labels(await _store_call(bot.store.players, self.tournament_id))
+            reporter_label = labels.get(int(self.reporter_id), interaction.user.display_name)
             view: discord.ui.View | None = None
             if event and event.get('type') == 'awaiting_confirmation':
-                message = (
-                    f"🏆 **Result Submitted**\n\n"
-                    f"⚽ **{player1_label} {fixture_score} {player2_label}**\n\n"
-                    f"⏳ {opponent_label}, please confirm this is correct, or dispute it if it isn't. "
-                    f"The match will not be completed or advanced until then."
-                )
+                message = f"Result submitted by **{reporter_label}** for **{opponent_name}**: **{shown_score}**.\n\n⏳ {opponent_name}, please confirm this is correct, or dispute it if it isn't. The match will not be completed or advanced until then."
                 view = ResultActionView(self.match_id, self.opponent_id)
             else:
-                message = f'✅ **Result Confirmed:** {player1_label} **{fixture_score}** {player2_label}.'
+                message = f'Result confirmed for **{reporter_label}** vs **{opponent_name}**: **{shown_score}**.'
                 message += await _apply_event_side_effects(self.guild, int(result['tournament_id']), event)
-            await respond(
-                interaction,
-                message,
-                view=view,
-                allowed_mentions=allowed_mentions,
-            )
+            await respond(interaction, message, view=view)
         except TournamentError as error:
             await respond(interaction, str(error), ephemeral=True)
         except Exception:
@@ -4571,7 +4515,7 @@ async def post_pending_confirmations(interaction: discord.Interaction, tournamen
         await respond(interaction, "This tournament's results channel could not be resolved from its stored channel ID. No confirmation buttons were posted.", ephemeral=True)
         return
     target_channel = result_channel
-    player_names, allowed_mentions = await result_display_labels(guild, tournament_id)
+    player_names = tournament_player_labels(await _store_call(bot.store.players, tournament_id))
     all_rows = await _store_call(bot.store.matches, tournament_id)
     number_by_id = {int(row['id']): index for index, row in enumerate(all_rows, 1)}
     posted = 0
@@ -4580,21 +4524,11 @@ async def post_pending_confirmations(interaction: discord.Interaction, tournamen
         player1_id = int(match['player1_id'])
         player2_id = int(match['player2_id'])
         opponent_id = player2_id if reporter_id == player1_id else player1_id
-        player1_mention = player_names.get(player1_id, format_user(guild, player1_id))
-        player2_mention = player_names.get(player2_id, format_user(guild, player2_id))
-        opponent_mention = player_names.get(opponent_id, format_user(guild, opponent_id))
+        reporter_mention = format_user(guild, reporter_id, player_names)
+        opponent_mention = format_user(guild, opponent_id, player_names)
         number = number_by_id.get(int(match['id']), int(match['id']))
-        message = (
-            f"`#{number}` 🏆 **Result Submitted**\n"
-            f"⚽ **{player1_mention} {match['score1']} - {match['score2']} {player2_mention}**\n\n"
-            f"⏳ {opponent_mention}, please confirm this is correct, or dispute it if it isn't. "
-            f"The match will not be completed or advanced until then."
-        )
-        await target_channel.send(
-            content=message,
-            view=ResultActionView(int(match['id']), opponent_id),
-            allowed_mentions=allowed_mentions,
-        )
+        message = f"`#{number}` **{reporter_mention}** vs **{opponent_mention}** — **{match['score1']} - {match['score2']}** submitted by {reporter_mention}.\n\n⏳ {opponent_mention}, please confirm this is correct, or dispute it if it isn't. The match will not be completed or advanced until then."
+        await target_channel.send(content=message, view=ResultActionView(int(match['id']), opponent_id))
         posted += 1
     await respond(interaction, f"Posted confirmation buttons for {posted} pending result{('s' if posted != 1 else '')} in {target_channel.mention}.", ephemeral=True)
 
@@ -4684,8 +4618,8 @@ async def ballon_dor_ranking(interaction: discord.Interaction, month: str) -> No
     if not re.fullmatch(r'\d{4}-\d{2}', month):
         await interaction.response.send_message('❌ Month must use **YYYY-MM** format, for example `2026-09`.', ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True)
     try:
-        await interaction.response.defer(ephemeral=True)
         rows = await _store_call(bot.store.ballon_dor_candidates_for_guild, interaction.guild.id, month)
         period = _golden_boot_month_label(month)
         embed = discord.Embed(
@@ -4695,10 +4629,10 @@ async def ballon_dor_ranking(interaction: discord.Interaction, month: str) -> No
         embed.set_footer(text="Competitive tournaments only · KO Match excluded · No assists required")
         await interaction.followup.send(embed=embed, ephemeral=True)
     except ValueError as exc:
-        await respond(interaction, f'❌ **Ranking unavailable.**\n\n{exc}', ephemeral=True)
+        await interaction.followup.send(f'❌ **Ranking unavailable.**\n\n{exc}', ephemeral=True)
     except Exception:
         logger.exception("Failed to calculate Ballon d'Or ranking for %s", month)
-        await respond(interaction, "❌ Failed to calculate the Ballon d'Or ranking. Check the bot logs.", ephemeral=True)
+        await interaction.followup.send("❌ Failed to calculate the Ballon d'Or ranking. Check the bot logs.", ephemeral=True)
 
 
 @bot.tree.command(name='ballon_dor_award', description="Award the monthly Ballon d'Or title role.")
@@ -4859,8 +4793,8 @@ async def golden_boot_standings(interaction: discord.Interaction, month: str, sc
     if not re.fullmatch(r'\d{4}-\d{2}', month):
         await interaction.response.send_message('❌ Month must use **YYYY-MM** format, for example `2026-09`.', ephemeral=True)
         return
+    await interaction.response.defer()
     try:
-        await interaction.response.defer()
         rows = await _store_call(bot.store.golden_boot_candidates_for_guild, interaction.guild.id, month, scope.value)
         period = _golden_boot_month_label(month)
         category = GOLDEN_BOOT_SCOPE_NAMES[scope.value]
@@ -4882,10 +4816,10 @@ async def golden_boot_standings(interaction: discord.Interaction, month: str, sc
         embed.set_footer(text=f"{category} · Official completed results only · KO Match excluded")
         await interaction.followup.send(embed=embed)
     except ValueError as exc:
-        await respond(interaction, f'❌ **Standings unavailable.**\n\n{exc}', ephemeral=True)
+        await interaction.followup.send(f'❌ **Standings unavailable.**\n\n{exc}', ephemeral=True)
     except Exception:
         logger.exception('Failed to calculate Golden Boot standings for %s/%s', month, scope.value)
-        await respond(interaction, '❌ Failed to calculate the Golden Boot standings. Check the bot logs.', ephemeral=True)
+        await interaction.followup.send('❌ Failed to calculate the Golden Boot standings. Check the bot logs.', ephemeral=True)
 
 
 @bot.tree.command(name='goal_records', description='Show goals scored by players in a competitive tournament.')

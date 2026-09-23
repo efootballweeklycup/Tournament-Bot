@@ -685,8 +685,6 @@ class TournamentStore:
         indexes = (
             """CREATE INDEX IF NOT EXISTS idx_tournaments_guild_status
                ON tournaments(guild_id, status)""",
-            """CREATE INDEX IF NOT EXISTS idx_tournaments_guild_status_template
-               ON tournaments(guild_id, status, template_id)""",
             """CREATE INDEX IF NOT EXISTS idx_players_tournament
                ON tournament_players(tournament_id)""",
             """CREATE INDEX IF NOT EXISTS idx_matches_tournament_stage
@@ -730,9 +728,6 @@ class TournamentStore:
             "tournament_players": {
                 "nation_name": "TEXT",
                 "group_name": "TEXT",
-            },
-            "goal_records": {
-                "nation_name": "TEXT",
             },
             "matches": {
                 "schedule_status": "TEXT NOT NULL DEFAULT 'unscheduled'",
@@ -2256,17 +2251,10 @@ class TournamentStore:
         return dict(row) if row else None
 
     def ballon_dor_candidates_for_guild(self, guild_id: int, month: str) -> list[dict[str, Any]]:
-        """Return an automatic monthly Ballon d'Or ranking for one guild.
-
-        The calculation is deliberately defensive: one malformed legacy
-        tournament must not make the entire monthly ranking command fail.
-        Official completed results are still the only source of goals/wins,
-        and KO Match (round_robin) remains excluded.
-        """
+        """Return an automatic monthly Ballon d'Or ranking for one guild."""
         month = str(month).strip()
-        if not re.fullmatch(r"\\d{4}-\\d{2}", month):
+        if not re.fullmatch(r"\d{4}-\d{2}", month):
             raise ValueError("Month must use YYYY-MM format, for example 2026-09.")
-
         with self._lock:
             tournaments = [dict(row) for row in self._all(
                 """SELECT * FROM tournaments
@@ -2276,137 +2264,74 @@ class TournamentStore:
                    ORDER BY id ASC""",
                 (int(guild_id), month, ROUND_ROBIN),
             )]
-
-            if not tournaments:
-                return []
-
             stats: dict[int, dict[str, Any]] = {}
 
-            def ensure_player(uid: int, name: str | None, nation: str | None) -> dict[str, Any]:
+            def ensure_player(uid: int, name: str, nation: str | None) -> dict[str, Any]:
                 row = stats.setdefault(uid, {
-                    'user_id': uid,
-                    'display_name': name or f'Player {uid}',
-                    'nation_name': nation,
-                    'goals': 0,
-                    'wins': 0,
-                    'championships': 0,
-                    'runner_ups': 0,
-                    'semifinals': 0,
-                    'score': 0,
-                    'tournaments_count': 0,
+                    'user_id': uid, 'display_name': name or f'Player {uid}',
+                    'nation_name': nation, 'goals': 0, 'wins': 0,
+                    'championships': 0, 'runner_ups': 0, 'semifinals': 0,
+                    'score': 0, 'tournaments_count': 0,
                 })
-                if name:
-                    row['display_name'] = name
                 if nation:
                     row['nation_name'] = nation
                 return row
 
             for tournament in tournaments:
                 tid = int(tournament['id'])
-                try:
-                    players = {int(p['user_id']): p for p in self.players(tid)}
-                    completed = [m for m in self.matches(tid) if m.get('status') == 'completed']
-
-                    involved: set[int] = set()
-                    for match in completed:
-                        for side, score_key in ((1, 'score1'), (2, 'score2')):
-                            uid = match.get(f'player{side}_id')
-                            if uid is None:
-                                continue
-                            uid = int(uid)
-                            involved.add(uid)
-                            p = players.get(uid, {})
-                            row = ensure_player(
-                                uid,
-                                str(p.get('display_name') or f'Player {uid}'),
-                                p.get('nation_name'),
-                            )
-                            row['goals'] += int(match.get(score_key) or 0)
-
-                            if match.get('score1') is not None and match.get('score2') is not None:
-                                other = 'score2' if side == 1 else 'score1'
-                                if int(match[score_key]) > int(match[other]):
-                                    row['wins'] += 1
-
-                    for uid in involved:
-                        p = players.get(uid, {})
-                        ensure_player(
-                            uid,
-                            str(p.get('display_name') or f'Player {uid}'),
-                            p.get('nation_name'),
-                        )['tournaments_count'] += 1
-
-                    placements: dict[int, tuple[str, int]] = {}
-                    if tournament.get('tournament_type') == GROUP_KNOCKOUT:
-                        try:
-                            result = self._validate_completed_champions_result(tid)
-                            placements = {
-                                int(uid): (place, int(points))
-                                for uid, (place, points) in result['placements'].items()
-                            }
-                        except ValueError as exc:
-                            # Legacy/incomplete playoff metadata should not
-                            # destroy the whole monthly ranking. Goals/wins
-                            # remain valid for this tournament.
-                            logger.warning(
-                                "Skipping Ballon d'Or placement bonus for tournament %s: %s",
-                                tid, exc,
-                            )
-                    elif tournament.get('tournament_type') == LEAGUE:
-                        try:
-                            table = self.standings(tid)
-                            if table:
-                                if len(table) >= 1:
-                                    placements[int(table[0].user_id)] = ('champion', 10)
-                                if len(table) >= 2:
-                                    placements[int(table[1].user_id)] = ('runner_up', 6)
-                                if len(table) >= 3:
-                                    placements[int(table[2].user_id)] = ('third_place', 3)
-                        except Exception:
-                            logger.exception(
-                                "Unable to calculate Ballon d'Or league placement bonus for tournament %s",
-                                tid,
-                            )
-
-                    for uid, (place, bonus) in placements.items():
-                        if uid not in players:
+                players = {int(p['user_id']): p for p in self.players(tid)}
+                completed = [m for m in self.matches(tid) if m.get('status') == 'completed']
+                involved: set[int] = set()
+                for match in completed:
+                    for side, score_key in ((1, 'score1'), (2, 'score2')):
+                        uid = match.get(f'player{side}_id')
+                        if uid is None:
                             continue
-                        p = players[uid]
-                        row = ensure_player(
-                            uid,
-                            str(p.get('display_name') or f'Player {uid}'),
-                            p.get('nation_name'),
-                        )
-                        row['score'] += int(bonus)
-                        if place == 'champion':
-                            row['championships'] += 1
-                        elif place == 'runner_up':
-                            row['runner_ups'] += 1
-                        elif place == 'semifinalist':
-                            row['semifinals'] += 1
+                        uid = int(uid); involved.add(uid)
+                        p = players.get(uid, {})
+                        row = ensure_player(uid, str(p.get('display_name') or f'Player {uid}'), p.get('nation_name'))
+                        row['goals'] += int(match.get(score_key) or 0)
+                        if match.get('score1') is not None and match.get('score2') is not None:
+                            other = 'score2' if side == 1 else 'score1'
+                            if int(match[score_key]) > int(match[other]):
+                                row['wins'] += 1
+                for uid in involved:
+                    ensure_player(uid, str(players.get(uid, {}).get('display_name') or f'Player {uid}'), players.get(uid, {}).get('nation_name'))['tournaments_count'] += 1
 
-                except Exception:
-                    # A single corrupt/legacy tournament must not prevent
-                    # rankings from all other valid tournaments being shown.
-                    logger.exception(
-                        "Unable to process tournament %s for Ballon d'Or ranking; continuing.",
-                        tid,
-                    )
+                placements: dict[int, tuple[str, int]] = {}
+                if tournament.get('tournament_type') == GROUP_KNOCKOUT:
+                    try:
+                        result = self._validate_completed_champions_result(tid)
+                        placements = {int(uid): (place, int(points)) for uid, (place, points) in result['placements'].items()}
+                    except ValueError:
+                        # A completed legacy tournament may not have a fully
+                        # shaped bracket. Goals/wins remain valid; don't make
+                        # the whole monthly ranking fail because placement
+                        # metadata cannot be safely inferred.
+                        placements = {}
+                elif tournament.get('tournament_type') == LEAGUE:
+                    try:
+                        table = self.standings(tid)
+                        if table:
+                            if len(table) >= 1: placements[int(table[0].user_id)] = ('champion', 10)
+                            if len(table) >= 2: placements[int(table[1].user_id)] = ('runner_up', 6)
+                            if len(table) >= 3: placements[int(table[2].user_id)] = ('third_place', 3)
+                    except Exception:
+                        placements = {}
+                for uid, (place, bonus) in placements.items():
+                    if uid not in players:
+                        continue
+                    row = ensure_player(uid, str(players[uid].get('display_name') or f'Player {uid}'), players[uid].get('nation_name'))
+                    row['score'] += int(bonus)
+                    if place == 'champion': row['championships'] += 1
+                    elif place == 'runner_up': row['runner_ups'] += 1
+                    elif place == 'semifinalist': row['semifinals'] += 1
 
             for row in stats.values():
                 row['score'] += int(row['goals']) + int(row['wins'])
                 row['placement_bonus'] = int(row['score']) - int(row['goals']) - int(row['wins'])
-
             rows = list(stats.values())
-            rows.sort(
-                key=lambda r: (
-                    -int(r['score']),
-                    -int(r['goals']),
-                    -int(r['wins']),
-                    str(r['display_name']).casefold(),
-                    int(r['user_id']),
-                )
-            )
+            rows.sort(key=lambda r: (-int(r['score']), -int(r['goals']), -int(r['wins']), str(r['display_name']).casefold(), int(r['user_id'])))
             for index, row in enumerate(rows, 1):
                 row['rank'] = index
             return rows
