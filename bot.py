@@ -481,10 +481,13 @@ class TournamentBot(commands.Bot):
         logger.info('Tournament database backend: %s%s', self.store.backend, ' (Railway PostgreSQL required)' if REQUIRE_POSTGRES else '')
 
     async def setup_hook(self) -> None:
+        # Global commands can take a while to propagate in Discord. The
+        # World Cup emergency command is also synced to each connected guild
+        # from on_ready so tournament staff can use it immediately.
         synced = await self.tree.sync()
         self.add_view(RegisterNowView())
         self.add_dynamic_items(ConfirmResultButton, DisputeResultButton, MatchSchedulePromptButton, MatchScheduleAcceptButton, MatchScheduleDeclineButton, MatchScheduleAnotherButton)
-        logger.info('Synced %d slash commands.', len(synced))
+        logger.info('Synced %d global slash commands.', len(synced))
 
     async def close(self) -> None:
         if lifecycle_sweep.is_running():
@@ -536,8 +539,31 @@ async def _ensure_existing_open_tournament_registration_button(guild: discord.Gu
     except Exception:
         logger.exception('Failed to recover the Register Now button for an already-open tournament.')
 
+_emergency_guild_sync_done: set[int] = set()
+
+async def _sync_world_cup_emergency_command_to_guild(guild: discord.Guild) -> None:
+    """Make the newly-added World Cup emergency command available immediately.
+
+    Discord global application-command propagation can be delayed. We copy the
+    current global command set into each connected guild once, then sync the
+    guild scope. This is intentionally limited to startup and does not alter
+    tournament data.
+    """
+    if guild.id in _emergency_guild_sync_done:
+        return
+    try:
+        self_tree = bot.tree
+        self_tree.copy_global_to(guild=guild)
+        synced = await self_tree.sync(guild=guild)
+        _emergency_guild_sync_done.add(guild.id)
+        logger.info('Guild command sync complete for %s (%s): %d commands.', guild.name, guild.id, len(synced))
+    except Exception:
+        logger.exception('Guild command sync failed for %s (%s).', guild.name, guild.id)
+
 @bot.event
 async def on_ready() -> None:
+    for _guild in list(bot.guilds):
+        await _sync_world_cup_emergency_command_to_guild(_guild)
     for _guild in list(bot.guilds):
         try:
             await _ensure_champions_infrastructure(_guild)
@@ -3666,7 +3692,7 @@ def get_active_stage(tournament_id: int) -> str:
 
 @bot.tree.command(name='world_cup_emergency_format', description='Apply the current World Cup Group D cancellation + 2 wild-card R16 format.')
 @app_commands.describe(tournament_id='World Cup 32 tournament ID', cancelled_group='Cancelled group (must be D)')
-@app_commands.default_permissions(manage_guild=True)
+@app_commands.default_permissions()
 @app_commands.checks.has_permissions(manage_guild=True)
 @app_commands.guild_only()
 async def world_cup_emergency_format(interaction: discord.Interaction, tournament_id: int, cancelled_group: str = 'D') -> None:
