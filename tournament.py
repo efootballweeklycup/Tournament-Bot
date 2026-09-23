@@ -624,6 +624,18 @@ class TournamentStore:
             # path) rather than dropped, so no destructive migration is
             # needed; ``_migrate_group_channel_columns`` below copies any
             # data already sitting in them into this table exactly once.
+            # Tournament-specific emergency qualification overrides.
+            # This preserves the normal World Cup format while allowing staff
+            # to alter qualification for one live tournament only.
+            self.connection.execute("""
+                CREATE TABLE IF NOT EXISTS tournament_emergency_formats (
+                    tournament_id BIGINT PRIMARY KEY REFERENCES tournaments(id) ON DELETE CASCADE,
+                    format_key TEXT NOT NULL,
+                    cancelled_group TEXT NOT NULL,
+                    wildcard_count INTEGER NOT NULL DEFAULT 2,
+                    applied_at TEXT NOT NULL
+                )
+            """)
             self.connection.execute("""
                 CREATE TABLE IF NOT EXISTS tournament_group_channels (
                     tournament_id BIGINT NOT NULL REFERENCES tournaments(id)
@@ -2884,6 +2896,139 @@ class TournamentStore:
         )
         return bool(rows) and all(row["status"] == "completed" for row in rows)
 
+    def _stage_complete_for_group(self, tournament_id: int, group_name: str) -> bool:
+        rows = self._all(
+            "SELECT status FROM matches WHERE tournament_id = ? AND stage = 'group' AND group_name = ?",
+            (int(tournament_id), str(group_name)),
+        )
+        return bool(rows) and all(row["status"] == "completed" for row in rows)
+
+    def world_cup_emergency_format(self, tournament_id: int, cancelled_group: str = "D") -> dict[str, Any]:
+        """Apply the current World Cup 32 Group-D emergency qualification rule.
+
+        Seven groups (A/B/C/E/F/G/H) send their top two directly to the R16.
+        The two best third-placed players across those groups take the two
+        remaining wildcard places. Group D is excluded entirely.
+
+        The override is stored per tournament, so normal World Cup templates
+        are unchanged. The R16 is generated only once all seven eligible
+        groups are complete. If the R16 already contains completed matches,
+        refuse to rewrite history.
+        """
+        tournament = self.get_tournament(tournament_id)
+        if not tournament or tournament.get("template_id") != TEMPLATE_WORLD_CUP_32:
+            raise TournamentError("This emergency format is only available for a World Cup 32 tournament.")
+        cancelled_group = str(cancelled_group or "").strip().upper()
+        if cancelled_group != "D":
+            raise TournamentError("The current World Cup emergency format only supports cancelling Group D.")
+
+        shape = self._group_knockout_shape_for(tournament_id)
+        groups = [g for g in shape["groups"] if g != cancelled_group]
+        if groups != ["A", "B", "C", "E", "F", "G", "H"]:
+            raise TournamentError("Unexpected World Cup group structure; emergency format was not applied.")
+
+        existing = self._one(
+            "SELECT * FROM tournament_emergency_formats WHERE tournament_id = ?",
+            (int(tournament_id),),
+        )
+        if existing and str(existing["format_key"]) != "world_cup_group_d_wildcards":
+            raise TournamentError("This tournament already has a different emergency format.")
+        if not existing:
+            self.connection.execute(
+                """INSERT INTO tournament_emergency_formats
+                   (tournament_id, format_key, cancelled_group, wildcard_count, applied_at)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (int(tournament_id), "world_cup_group_d_wildcards", cancelled_group, 2, self._now()),
+            )
+
+        # Group D is never considered for qualification, even if it has valid
+        # standings/results left in the database.
+        incomplete = [g for g in groups if not self._stage_complete_for_group(tournament_id, g)]
+        if incomplete:
+            return {
+                "status": "waiting",
+                "cancelled_group": cancelled_group,
+                "incomplete_groups": incomplete,
+                "qualifiers": [],
+                "wildcards": [],
+                "matchups_created": False,
+            }
+
+        first_stage = "round_of_16"
+        current = self.matches(tournament_id, stage=first_stage)
+        if current:
+            completed = [m for m in current if m.get("status") == "completed"]
+            if completed:
+                raise TournamentError("Round of 16 already has completed matches; refusing to rewrite tournament history.")
+            self.connection.execute(
+                "DELETE FROM matches WHERE tournament_id = ? AND stage = ?",
+                (int(tournament_id), first_stage),
+            )
+
+        qualifiers: dict[str, list[Standing]] = {}
+        for group in groups:
+            table = self.standings(tournament_id, group)
+            if len(table) < 3:
+                raise TournamentError(f"Group {group} does not have enough players for the emergency qualification rule.")
+            qualifiers[group] = table
+
+        direct = {g: qualifiers[g][:2] for g in groups}
+        third_rows = []
+        for group in groups:
+            row = qualifiers[group][2]
+            third_rows.append((group, row))
+
+        # Requested tiebreak order: PTS, GD, GF, W. If those are still tied,
+        # use GA (lower is better) and finally Discord user ID as a deterministic
+        # last-resort ordering. H2H is impossible between different groups.
+        third_rows.sort(key=lambda item: (
+            -item[1].points,
+            -item[1].goal_difference,
+            -item[1].goals_for,
+            -item[1].wins,
+            item[1].goals_against,
+            item[1].user_id,
+        ))
+        wildcards = [row for _, row in third_rows[:2]]
+
+        # Deterministic R16 pairing. The cancelled group's two slots are replaced
+        # by the wildcard qualifiers, keeping the same crossed-group pattern:
+        # A/B, C/E, F/G, and H/WC.
+        pairings = [
+            (direct["A"][0].user_id, direct["B"][1].user_id),
+            (direct["B"][0].user_id, direct["A"][1].user_id),
+            (direct["C"][0].user_id, direct["E"][1].user_id),
+            (direct["E"][0].user_id, direct["C"][1].user_id),
+            (direct["F"][0].user_id, direct["G"][1].user_id),
+            (direct["G"][0].user_id, direct["F"][1].user_id),
+            (direct["H"][0].user_id, wildcards[1].user_id),
+            (wildcards[0].user_id, direct["H"][1].user_id),
+        ]
+        self._insert_knockout_matches(tournament_id, first_stage, pairings)
+        deadline = self._set_stage_deadline(tournament_id, first_stage, self._knockout_deadline_hours(first_stage))
+        self.connection.commit()
+        return {
+            "status": "applied",
+            "cancelled_group": cancelled_group,
+            "incomplete_groups": [],
+            "qualifiers": [r.user_id for g in groups for r in direct[g]],
+            "wildcards": [r.user_id for r in wildcards],
+            "wildcard_details": [
+                {"rank": i + 1, "user_id": r.user_id, "display_name": r.display_name,
+                 "points": r.points, "gd": r.goal_difference, "gf": r.goals_for, "wins": r.wins}
+                for i, r in enumerate(wildcards)
+            ],
+            "matchups_created": True,
+            "deadline_at": deadline,
+        }
+
+    def world_cup_emergency_format_status(self, tournament_id: int) -> dict[str, Any] | None:
+        row = self._one(
+            "SELECT * FROM tournament_emergency_formats WHERE tournament_id = ?",
+            (int(tournament_id),),
+        )
+        return dict(row) if row else None
+
     def _advance_if_ready(self, tournament_id: int) -> dict[str, Any] | None:
         tournament = self.get_tournament(tournament_id)
         if not tournament:
@@ -2901,6 +3046,12 @@ class TournamentStore:
         qualify_n = shape["qualify_per_group"]
         stages = shape["knockout_stages"]
         first_stage = stages[0]
+
+        emergency = self.world_cup_emergency_format_status(tournament_id)
+        if emergency and str(emergency.get("format_key")) == "world_cup_group_d_wildcards":
+            if not self._stage_has_matches(tournament_id, first_stage):
+                return self.world_cup_emergency_format(tournament_id, str(emergency.get("cancelled_group") or "D"))
+            return None
 
         if self._stage_complete(tournament_id, "group") and not self._stage_has_matches(
             tournament_id, first_stage

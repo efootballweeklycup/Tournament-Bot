@@ -3664,6 +3664,57 @@ def get_active_stage(tournament_id: int) -> str:
             return stage
     return 'group'
 
+@bot.tree.command(name='world_cup_emergency_format', description='Apply the current World Cup Group D cancellation + 2 wild-card R16 format.')
+@app_commands.describe(tournament_id='World Cup 32 tournament ID', cancelled_group='Cancelled group (must be D)')
+@app_commands.default_permissions(manage_guild=True)
+@app_commands.checks.has_permissions(manage_guild=True)
+@app_commands.guild_only()
+async def world_cup_emergency_format(interaction: discord.Interaction, tournament_id: int, cancelled_group: str = 'D') -> None:
+    """Apply the live World Cup Group D emergency qualification format."""
+    guild = require_guild(interaction)
+    tournament = await _store_call(bot.store.get_tournament, tournament_id)
+    if not tournament or int(tournament.get('guild_id', 0)) != guild.id or str(tournament.get('template_id') or '') != TEMPLATE_WORLD_CUP_32:
+        await respond(interaction, '❌ That is not a World Cup 32 tournament in this server.', ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await _store_call(bot.store.world_cup_emergency_format, tournament_id, cancelled_group)
+        if result['status'] == 'waiting':
+            groups = ', '.join(result['incomplete_groups'])
+            await respond(
+                interaction,
+                f"✅ **World Cup emergency format saved.**\n\n"
+                f"❌ Group **D** is cancelled and excluded from qualification.\n"
+                f"🃏 The **2 best third-place players** from Groups A, B, C, E, F, G & H will receive the wildcard spots.\n\n"
+                f"⏳ Round of 16 will be generated automatically when these groups are complete: **{groups}**.",
+                ephemeral=True,
+            )
+            return
+        wildcards = result.get('wildcard_details', [])
+        wc_text = '\n'.join(
+            f"🃏 **Wildcard #{i+1}:** {w['display_name']} — {w['points']} PTS | {w['gd']:+d} GD | {w['gf']} GF | {w['wins']} W"
+            for i, w in enumerate(wildcards)
+        ) or 'None'
+        await respond(
+            interaction,
+            f"🏆 **World Cup Emergency Format Applied**\n\n"
+            f"❌ **Group D — Cancelled**\n"
+            f"🃏 **Wild Cards:**\n{wc_text}\n\n"
+            f"✅ **16 Round of 16 participants generated.**\n"
+            f"📅 Round of 16 deadline: <t:{int(datetime.fromisoformat(result['deadline_at'].replace('Z','+00:00')).timestamp())}:F>",
+            ephemeral=True,
+        )
+        # Repost the generated R16 fixtures using the existing country-role-aware renderer.
+        try:
+            await post_playoff_fixtures(guild, tournament_id, 'round_of_16')
+        except Exception:
+            logger.exception('Emergency World Cup R16 was generated but fixture repost failed for tournament %s', tournament_id)
+    except TournamentError as error:
+        await respond(interaction, f'❌ {error}', ephemeral=True)
+    except Exception:
+        logger.exception('Failed to apply World Cup emergency format for tournament %s', tournament_id)
+        await respond(interaction, '❌ Failed to apply the World Cup emergency format. Check the bot logs.', ephemeral=True)
+
 @bot.tree.command(name='world_cup_sync_country_roles', description='Sync existing World Cup players with their saved country roles.')
 @app_commands.describe(tournament_id='World Cup 32 tournament ID')
 @app_commands.default_permissions(manage_guild=True)
