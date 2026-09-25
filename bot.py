@@ -2396,16 +2396,51 @@ async def _ensure_ballon_dor_role(guild: discord.Guild, month: str) -> discord.R
     return role
 
 
-def _ballon_dor_display_name(row: dict[str, Any]) -> str:
-    return str(row.get('nation_name') or row.get('display_name') or f"Player {row['user_id']}")
+async def _ranking_display_name(
+    guild: discord.Guild, row: dict[str, Any],
+) -> str:
+    """Resolve a ranking player's Discord identity without using tournament nation/team as identity.
+
+    Ranking statistics are keyed by the persistent tournament participant's
+    Discord user ID.  The assigned nation/team is only tournament metadata and
+    is used as the final fallback when Discord identity cannot be resolved.
+    """
+    user_id = int(row['user_id'])
+    member = guild.get_member(user_id)
+    if member is None:
+        try:
+            member = await guild.fetch_member(user_id)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            member = None
+
+    if member is not None:
+        display_name = str(getattr(member, 'display_name', '') or '').strip()
+        if display_name:
+            return display_name
+        username = str(getattr(member, 'name', '') or '').strip()
+        if username:
+            return username
+
+    stored_name = str(row.get('display_name') or '').strip()
+    if stored_name:
+        return stored_name
+
+    nation_name = str(row.get('nation_name') or '').strip()
+    if nation_name:
+        return nation_name
+
+    return f"Player {user_id}"
 
 
-def _format_ballon_dor_ranking(rows: list[dict[str, Any]], limit: int = 20) -> str:
+async def _format_ballon_dor_ranking(
+    guild: discord.Guild, rows: list[dict[str, Any]], limit: int = 20,
+) -> str:
     lines = []
     for row in rows[:limit]:
         placement = int(row.get('placement_bonus', 0))
+        display_name = await _ranking_display_name(guild, row)
         lines.append(
-            f"**#{int(row['rank'])}** {_ballon_dor_display_name(row)} — **{int(row['score'])} pts** "
+            f"**#{int(row['rank'])}** {display_name} — **{int(row['score'])} pts** "
             f"(⚽ {int(row['goals'])} + 🏆/🏅 {placement} + ✅ {int(row['wins'])} wins)"
         )
     return '\n'.join(lines) or 'No qualifying competitive players were found for this month.'
@@ -4701,7 +4736,7 @@ async def ballon_dor_ranking(interaction: discord.Interaction, month: str) -> No
         period = _golden_boot_month_label(month)
         embed = discord.Embed(
             title=f"🏆 Ballon d'Or Ranking — {period}",
-            description=_format_ballon_dor_ranking(rows),
+            description=await _format_ballon_dor_ranking(interaction.guild, rows),
         )
         embed.set_footer(text="Live from official completed match results · Tournament start month locked · KO Match excluded")
         await interaction.followup.send(embed=embed, ephemeral=True)
@@ -4877,7 +4912,7 @@ async def golden_boot_standings(interaction: discord.Interaction, month: str, sc
         category = GOLDEN_BOOT_SCOPE_NAMES[scope.value]
         lines = []
         for rank, row in enumerate(rows[:20], 1):
-            label = str(row.get('nation_name') or row.get('display_name') or f"Player {row['user_id']}")
+            label = await _ranking_display_name(interaction.guild, row)
             goals = int(row.get('goals') or 0)
             tournaments_count = int(row.get('tournaments_count') or 0)
             lines.append(
