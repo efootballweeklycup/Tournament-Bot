@@ -3049,9 +3049,29 @@ class TournamentStore:
 
         emergency = self.world_cup_emergency_format_status(tournament_id)
         if emergency and str(emergency.get("format_key")) == "world_cup_group_d_wildcards":
+            # The emergency-format override only changes how the FIRST knockout
+            # stage (World Cup R16) is generated. Once the R16 fixtures exist,
+            # normal knockout advancement must continue to run.
+            #
+            # v42 incorrectly returned here whenever the emergency-format row
+            # existed. That meant the R16 could be completed successfully, but
+            # _advance_if_ready() would stop before reaching the generic loop
+            # that creates the quarterfinals.
             if not self._stage_has_matches(tournament_id, first_stage):
-                return self.world_cup_emergency_format(tournament_id, str(emergency.get("cancelled_group") or "D"))
-            return None
+                result = self.world_cup_emergency_format(
+                    tournament_id, str(emergency.get("cancelled_group") or "D")
+                )
+                if result.get("status") == "applied":
+                    return {
+                        "type": "qualified",
+                        "stage": first_stage,
+                        "deadline_at": result.get("deadline_at"),
+                        "qualifiers": result.get("qualifiers", []) + result.get("wildcards", []),
+                        "qualifier_ids": result.get("qualifiers", []) + result.get("wildcards", []),
+                    }
+                return None
+            # R16 already exists: fall through to the standard stage-advance
+            # loop below so completed R16 -> QF -> SF -> Final works normally.
 
         if self._stage_complete(tournament_id, "group") and not self._stage_has_matches(
             tournament_id, first_stage
