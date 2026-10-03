@@ -4045,6 +4045,152 @@ async def send_message(interaction: discord.Interaction, message: str, channel: 
         return
     await respond(interaction, f'✅ Message sent privately to {participant.mention}.', ephemeral=True)
 
+@bot.tree.command(name='notify_unregistered', description='DM server members who are not registered for the current tournament.')
+@staff_messaging_access()
+@app_commands.describe(
+    registration_url='The official Toornament registration URL.',
+    message='Optional custom registration message (up to 1800 characters).',
+    confirm='Set to True to actually send the DMs; False only shows the recipient count.',
+    tournament_id='Optional tournament ID; defaults to the current open tournament.',
+)
+@app_commands.guild_only()
+async def notify_unregistered(
+    interaction: discord.Interaction,
+    registration_url: str,
+    message: str | None = None,
+    confirm: bool = False,
+    tournament_id: int | None = None,
+) -> None:
+    """Notify human server members who have not joined the current tournament.
+
+    The bot does not currently have a Toornament API integration, so it cannot
+    independently verify an external Toornament participant list. The
+    authoritative list available to this bot is ``tournament_players`` (the
+    users who registered through the bot). This command therefore targets
+    guild members who are not in that tournament's participant list. The
+    official Toornament URL is included in the DM so recipients can register
+    there.
+
+    ``confirm=False`` is intentionally a dry run. Staff must explicitly pass
+    ``confirm=True`` before any DMs are sent, preventing accidental server-wide
+    spam.
+    """
+    guild = require_guild(interaction)
+    url = str(registration_url or '').strip()
+    if not re.match(r'^https?://', url, re.IGNORECASE):
+        await respond(interaction, '❌ Please provide a valid Toornament registration URL beginning with `https://` or `http://`.', ephemeral=True)
+        return
+    if len(url) > 1000:
+        await respond(interaction, '❌ The registration URL is too long.', ephemeral=True)
+        return
+
+    tournament = await _call_off_loop(
+        resolve_tournament_for_interaction,
+        guild,
+        interaction,
+        ((OPEN,),),
+        tournament_id,
+    )
+    if not tournament:
+        await respond(interaction, '❌ There is no open tournament to promote.', ephemeral=True)
+        return
+
+    tid = int(tournament['id'])
+    participant_rows = await _store_call(bot.store.players, tid)
+    participant_ids = {int(row['user_id']) for row in participant_rows}
+
+    # Members intent is enabled by TournamentBot.__init__.  Fetch the current
+    # guild membership rather than relying only on the cache, so the command
+    # can reach members who joined the server recently.
+    try:
+        members = [member async for member in guild.fetch_members(limit=None)]
+    except discord.Forbidden:
+        await respond(interaction, '❌ I cannot fetch the server member list. Enable the **Server Members Intent** for the bot and try again.', ephemeral=True)
+        return
+    except discord.HTTPException as error:
+        logger.warning('Failed to fetch guild members for registration notification: %s', error)
+        await respond(interaction, '❌ Discord could not provide the server member list. Please try again later.', ephemeral=True)
+        return
+
+    recipients = [member for member in members if not member.bot and member.id not in participant_ids]
+    tournament_name = str(tournament.get('name') or 'Tournament')
+
+    if not recipients:
+        await respond(interaction, f'ℹ️ **{tournament_name}** has no unregistered human server members to notify.', ephemeral=True)
+        return
+
+    if len(recipients) > 1000 and not confirm:
+        await respond(
+            interaction,
+            f'⚠️ This would DM **{len(recipients)}** unregistered members for **{tournament_name}**. '
+            'That is a very large broadcast. Review your server membership and run the command again with `confirm: True` only if this is intentional.',
+            ephemeral=True,
+        )
+        return
+
+    if not confirm:
+        await respond(
+            interaction,
+            f'📢 **Registration notification preview**\n\n'
+            f'Tournament: **{tournament_name}**\n'
+            f'Registered in the bot: **{len(participant_ids)}**\n'
+            f'Human server members to DM: **{len(recipients)}**\n\n'
+            f'No DMs were sent. Run `/notify_unregistered` again with `confirm: True` to send them.\n'
+            f'Toornament: {url}',
+            ephemeral=True,
+        )
+        return
+
+    default_message = (
+        f'🏆 **{tournament_name} — Registration is OPEN!**\n\n'
+        'You are not currently registered for this tournament.\n\n'
+        'If you want to participate, register now through the official Toornament registration page:\n'
+        f'🔗 {url}\n\n'
+        '⚠️ Slots may be limited, so register as soon as possible!'
+    )
+    body = str(message).strip() if message and message.strip() else default_message
+    if len(body) > 1800:
+        await respond(interaction, '❌ The custom message must be 1800 characters or fewer.', ephemeral=True)
+        return
+    # Always append the official link unless the staff message already contains it.
+    if url not in body:
+        body = f'{body}\n\n🔗 **Register here:** {url}'
+    if len(body) > 2000:
+        await respond(interaction, '❌ The final DM would exceed Discord\'s 2000-character limit. Shorten the custom message.', ephemeral=True)
+        return
+
+    await respond(
+        interaction,
+        f'📤 Starting registration notifications for **{len(recipients)}** unregistered members of **{tournament_name}**…',
+        ephemeral=True,
+    )
+
+    sent = 0
+    failed = 0
+    for member in recipients:
+        try:
+            await member.send(body)
+            sent += 1
+        except (discord.Forbidden, discord.NotFound):
+            failed += 1
+            logger.info('Could not DM unregistered member %s (%s); DMs may be disabled.', member.id, member)
+        except discord.HTTPException as error:
+            failed += 1
+            logger.warning('Discord rejected registration DM to %s: %s', member.id, error)
+        # Avoid turning a large registration announcement into a burst of DM
+        # requests. Discord.py handles normal rate limits, but a small pause
+        # also makes the operation friendlier to Discord's API.
+        await asyncio.sleep(0.35)
+
+    await interaction.followup.send(
+        f'✅ **Registration notification complete**\n\n'
+        f'Tournament: **{tournament_name}**\n'
+        f'Eligible/unregistered: **{len(recipients)}**\n'
+        f'📨 DMs sent: **{sent}**\n'
+        f'⚠️ Failed/disabled DMs: **{failed}**',
+        ephemeral=True,
+    )
+
 @bot.tree.command(name='matches', description='Show tournament fixtures.')
 @tournament_channel_only('fixture', 'participant', 'group', 'organizer', 'playoffs', 'playoffs_fixtures')
 @app_commands.describe(only_mine='Show only your matches', group='For group tournaments, optionally show one group')
